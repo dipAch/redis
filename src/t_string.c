@@ -480,6 +480,12 @@ void strlenCommand(client *c) {
     addReplyLongLong(c,stringObjectLen(o));
 }
 
+void palindromeCommand(client *c) {
+    robj *o;
+    if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL ||
+        checkType(c, o, OBJ_STRING)) return;
+    stringObjectPalindrome(c, o);
+}
 
 /* STRALGO -- Implement complex algorithms on strings.
  *

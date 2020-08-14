@@ -612,6 +612,34 @@ size_t stringObjectLen(robj *o) {
     }
 }
 
+void stringObjectPalindrome(client *c, robj *o) {
+    serverAssertWithInfo(NULL, o, o->type == OBJ_STRING);
+
+    sds value;
+    size_t string_length, tail_pointer;
+
+    if (sdsEncodedObject(o)) {
+        value = o->ptr;
+        string_length = sdslen(value);
+    } else {
+        char buf[32];
+        string_length = ll2string(buf, sizeof(buf), (long)o->ptr);
+        value = (sds)buf;
+    }
+
+    tail_pointer = string_length - 1;
+
+    for (size_t idx=0; idx < string_length; idx++) {
+        if (value[idx] != value[tail_pointer]) {
+            addReplyBulkCString(c, "false");
+            return;
+        }
+        tail_pointer--;
+    }
+
+    addReplyBulkCString(c, "true");
+}
+
 int getDoubleFromObject(const robj *o, double *target) {
     double value;
 

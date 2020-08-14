@@ -214,6 +214,10 @@ struct redisCommand redisCommandTable[] = {
      "read-only fast @string",
      0,NULL,1,1,1,0,0,0},
 
+    {"palindrome", palindromeCommand, 2,
+     "read-only fast @string",
+     0, NULL, 1, 1, 1, 0, 0, 0},
+
     {"del",delCommand,-2,
      "write @keyspace",
      0,NULL,1,-1,1,0,0,0},
