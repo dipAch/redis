@@ -55,7 +55,8 @@ typedef ucontext_t sigcontext_t;
 #endif
 
 /* Globals */
-static _Atomic int bug_report_start = 0; /* True if bug report header was already logged. */
+static int bug_report_start = 0; /* True if bug report header was already logged. */
+static pthread_mutex_t bug_report_start_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Forward declarations */
 void bugReportStart(void);
@@ -397,7 +398,7 @@ void debugCommand(client *c) {
 "OOM -- Crash the server simulating an out-of-memory error.",
 "PANIC -- Crash the server simulating a panic.",
 "POPULATE <count> [prefix] [size] -- Create <count> string keys named key:<num>. If a prefix is specified is used instead of the 'key' prefix.",
-"RELOAD [MERGE] [NOFLUSH] [NOSAVE] -- Save the RDB on disk and reload it back in memory. By default it will save the RDB file and load it back. With the NOFLUSH option the current database is not removed before loading the new one, but conficts in keys will kill the server with an exception. When MERGE is used, conflicting keys will be loaded (the key in the loaded RDB file will win). When NOSAVE is used, the server will not save the current dataset in the RDB file before loading. Use DEBUG RELOAD NOSAVE when you want just to load the RDB file you placed in the Redis working directory in order to replace the current dataset in memory. Use DEBUG RELOAD NOSAVE NOFLUSH MERGE when you want to add what is in the current RDB file placed in the Redis current directory, with the current memory content. Use DEBUG RELOAD when you want to verify Redis is able to persist the current dataset in the RDB file, flush the memory content, and load it back.",
+"RELOAD [MERGE] [NOFLUSH] [NOSAVE] -- Save the RDB on disk and reload it back in memory. By default it will save the RDB file and load it back. With the NOFLUSH option the current database is not removed before loading the new one, but conflicts in keys will kill the server with an exception. When MERGE is used, conflicting keys will be loaded (the key in the loaded RDB file will win). When NOSAVE is used, the server will not save the current dataset in the RDB file before loading. Use DEBUG RELOAD NOSAVE when you want just to load the RDB file you placed in the Redis working directory in order to replace the current dataset in memory. Use DEBUG RELOAD NOSAVE NOFLUSH MERGE when you want to add what is in the current RDB file placed in the Redis current directory, with the current memory content. Use DEBUG RELOAD when you want to verify Redis is able to persist the current dataset in the RDB file, flush the memory content, and load it back.",
 "RESTART -- Graceful restart: save config, db, restart.",
 "SDSLEN <key> -- Show low level SDS string info representing key and value.",
 "SEGFAULT -- Crash the server with sigsegv.",
@@ -407,6 +408,7 @@ void debugCommand(client *c) {
 "STRUCTSIZE -- Return the size of different Redis core C structures.",
 "ZIPLIST <key> -- Show low level info about the ziplist encoding.",
 "STRINGMATCH-TEST -- Run a fuzz tester against the stringmatchlen() function.",
+"CONFIG-REWRITE-FORCE-ALL -- Like CONFIG REWRITE but writes all configuration options, including keywords not listed in original configuration file or default values.",
 #ifdef USE_JEMALLOC
 "MALLCTL <key> [<val>] -- Get or set a malloc tunning integer.",
 "MALLCTL-STR <key> [<val>] -- Get or set a malloc tunning string.",
@@ -465,7 +467,7 @@ NULL
             }
         }
 
-        /* The default beahvior is to save the RDB file before loading
+        /* The default behavior is to save the RDB file before loading
          * it back. */
         if (save) {
             rdbSaveInfo rsi, *rsiptr;
@@ -587,7 +589,7 @@ NULL
                 == NULL) return;
 
         if (o->encoding != OBJ_ENCODING_ZIPLIST) {
-            addReplyError(c,"Not an sds encoded string.");
+            addReplyError(c,"Not a ziplist encoded object.");
         } else {
             ziplistRepr(o->ptr);
             addReplyStatus(c,"Ziplist structure printed on stdout");
@@ -804,6 +806,12 @@ NULL
     {
         stringmatchlen_fuzz_test();
         addReplyStatus(c,"Apparently Redis did not crash: test passed");
+    } else if (!strcasecmp(c->argv[1]->ptr,"config-rewrite-force-all") && c->argc == 2)
+    {
+        if (rewriteConfig(server.configfile, 1) == -1)
+            addReplyError(c, "CONFIG-REWRITE-FORCE-ALL failed");
+        else
+            addReply(c, shared.ok);
 #ifdef USE_JEMALLOC
     } else if(!strcasecmp(c->argv[1]->ptr,"mallctl") && c->argc >= 3) {
         mallctl_int(c, c->argv+2, c->argc-2);
@@ -919,11 +927,13 @@ void _serverPanic(const char *file, int line, const char *msg, ...) {
 }
 
 void bugReportStart(void) {
+    pthread_mutex_lock(&bug_report_start_mutex);
     if (bug_report_start == 0) {
         serverLogRaw(LL_WARNING|LL_RAW,
         "\n\n=== REDIS BUG REPORT START: Cut & paste starting from here ===\n");
         bug_report_start = 1;
     }
+    pthread_mutex_unlock(&bug_report_start_mutex);
 }
 
 #ifdef HAVE_BACKTRACE
@@ -1492,7 +1502,7 @@ void logCurrentClient(void) {
 
 #define MEMTEST_MAX_REGIONS 128
 
-/* A non destructive memory test executed during segfauls. */
+/* A non destructive memory test executed during segfault. */
 int memtest_test_linux_anonymous_maps(void) {
     FILE *fp;
     char line[1024];
@@ -1800,4 +1810,13 @@ void disableWatchdog(void) {
     act.sa_handler = SIG_IGN;
     sigaction(SIGALRM, &act, NULL);
     server.watchdog_period = 0;
+}
+
+/* Positive input is sleep time in microseconds. Negative input is fractions
+ * of microseconds, i.e. -10 means 100 nanoseconds. */
+void debugDelay(int usec) {
+    /* Since even the shortest sleep results in context switch and system call,
+     * the way we achive short sleeps is by statistically sleeping less often. */
+    if (usec < 0) usec = (rand() % -usec) == 0 ? 1: 0;
+    if (usec) usleep(usec);
 }

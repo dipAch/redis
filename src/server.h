@@ -150,10 +150,18 @@ typedef long long ustime_t; /* microsecond time type. */
  * in order to make sure of not over provisioning more than 128 fds. */
 #define CONFIG_FDSET_INCR (CONFIG_MIN_RESERVED_FDS+96)
 
+/* OOM Score Adjustment classes. */
+#define CONFIG_OOM_MASTER 0
+#define CONFIG_OOM_REPLICA 1
+#define CONFIG_OOM_BGCHILD 2
+#define CONFIG_OOM_COUNT 3
+
+extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
+
 /* Hash table parameters */
 #define HASHTABLE_MIN_FILL        10      /* Minimal hash table fill 10% */
 
-/* Command flags. Please check the command table defined in the redis.c file
+/* Command flags. Please check the command table defined in the server.c file
  * for more information about the meaning of every flag. */
 #define CMD_WRITE (1ULL<<0)            /* "write" flag */
 #define CMD_READONLY (1ULL<<1)         /* "read-only" flag */
@@ -819,7 +827,7 @@ typedef struct client {
                                        copying this slave output buffer
                                        should use. */
     char replid[CONFIG_RUN_ID_SIZE+1]; /* Master replication ID (if master). */
-    int slave_listening_port; /* As configured with: SLAVECONF listening-port */
+    int slave_listening_port; /* As configured with: REPLCONF listening-port */
     char slave_ip[NET_IP_STR_LEN]; /* Optionally given by REPLCONF ip-address */
     int slave_capa;         /* Slave capabilities: SLAVE_CAPA_* bitwise OR. */
     multiState mstate;      /* MULTI/EXEC state */
@@ -931,7 +939,7 @@ typedef struct redisOp {
 } redisOp;
 
 /* Defines an array of Redis operations. There is an API to add to this
- * structure in a easy way.
+ * structure in an easy way.
  *
  * redisOpArrayInit();
  * redisOpArrayAppend();
@@ -1249,17 +1257,20 @@ struct redisServer {
     int rdb_child_type;             /* Type of save by active child. */
     int lastbgsave_status;          /* C_OK or C_ERR */
     int stop_writes_on_bgsave_err;  /* Don't allow writes if can't BGSAVE */
-    int rdb_pipe_write;             /* RDB pipes used to transfer the rdb */
-    int rdb_pipe_read;              /* data to the parent process in diskless repl. */
+    int rdb_pipe_read;              /* RDB pipe used to transfer the rdb data */
+                                    /* to the parent process in diskless repl. */
+    int rdb_child_exit_pipe;        /* Used by the diskless parent allow child exit. */
     connection **rdb_pipe_conns;    /* Connections which are currently the */
     int rdb_pipe_numconns;          /* target of diskless rdb fork child. */
     int rdb_pipe_numconns_writing;  /* Number of rdb conns with pending writes. */
     char *rdb_pipe_buff;            /* In diskless replication, this buffer holds data */
     int rdb_pipe_bufflen;           /* that was read from the the rdb pipe. */
     int rdb_key_save_delay;         /* Delay in microseconds between keys while
-                                     * writing the RDB. (for testings) */
+                                     * writing the RDB. (for testings). negative
+                                     * value means fractions of microsecons (on average). */
     int key_load_delay;             /* Delay in microseconds between keys while
-                                     * loading aof or rdb. (for testings) */
+                                     * loading aof or rdb. (for testings). negative
+                                     * value means fractions of microsecons (on average). */
     /* Pipe and data structures for child -> parent info sharing. */
     int child_info_pipe[2];         /* Pipe used to write the child_info_data. */
     struct {
@@ -1346,10 +1357,13 @@ struct redisServer {
     unsigned int maxclients;            /* Max number of simultaneous clients */
     unsigned long long maxmemory;   /* Max number of memory bytes to use */
     int maxmemory_policy;           /* Policy for key eviction */
-    int maxmemory_samples;          /* Pricision of random sampling */
+    int maxmemory_samples;          /* Precision of random sampling */
     int lfu_log_factor;             /* LFU logarithmic counter factor. */
     int lfu_decay_time;             /* LFU counter decay factor. */
     long long proto_max_bulk_len;   /* Protocol bulk length maximum size. */
+    int oom_score_adj_base;         /* Base oom_score_adj value, as observed on startup */
+    int oom_score_adj_values[CONFIG_OOM_COUNT];   /* Linux oom_score_adj configuration */
+    int oom_score_adj;                            /* If true, oom_score_adj is managed */
     /* Blocked clients */
     unsigned int blocked_clients;   /* # of clients executing a blocking cmd.*/
     unsigned int blocked_clients_by_type[BLOCKED_NUM];
@@ -1382,6 +1396,7 @@ struct redisServer {
     int daylight_active;        /* Currently in daylight saving time. */
     mstime_t mstime;            /* 'unixtime' in milliseconds. */
     ustime_t ustime;            /* 'unixtime' in microseconds. */
+    long long blocked_last_cron; /* Indicate the mstime of the last time we did cron jobs from a blocking operation */
     /* Pubsub */
     dict *pubsub_channels;  /* Map channels to list of subscribed clients */
     list *pubsub_patterns;  /* A list of pubsub_patterns */
@@ -1408,6 +1423,7 @@ struct redisServer {
                                       REDISMODULE_CLUSTER_FLAG_*. */
     int cluster_allow_reads_when_down; /* Are reads allowed when the cluster
                                         is down? */
+    int cluster_config_file_lock_fd;   /* cluster config fd, will be flock */
     /* Scripting */
     lua_State *lua; /* The Lua interpreter. We use just one for all clients */
     client *lua_client;   /* The "fake client" to query Redis from Lua */
@@ -1422,7 +1438,7 @@ struct redisServer {
     int lua_random_dirty; /* True if a random command was called during the
                              execution of the current script. */
     int lua_replicate_commands; /* True if we are doing single commands repl. */
-    int lua_multi_emitted;/* True if we already proagated MULTI. */
+    int lua_multi_emitted;/* True if we already propagated MULTI. */
     int lua_repl;         /* Script replication flags for redis.set_repl(). */
     int lua_timedout;     /* True if we reached the time limit for script
                              execution. */
@@ -1572,6 +1588,7 @@ extern dictType modulesDictType;
 
 /* Modules */
 void moduleInitModulesSystem(void);
+void moduleInitModulesSystemLast(void);
 int moduleLoad(const char *path, void **argv, int argc);
 void moduleLoadFromQueue(void);
 int *moduleGetCommandKeysViaAPI(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
@@ -1584,6 +1601,7 @@ void moduleBlockedClientTimedOut(client *c);
 void moduleBlockedClientPipeReadable(aeEventLoop *el, int fd, void *privdata, int mask);
 size_t moduleCount(void);
 void moduleAcquireGIL(void);
+int moduleTryAcquireGIL(void);
 void moduleReleaseGIL(void);
 void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid);
 void moduleCallCommandFilters(client *c);
@@ -1644,7 +1662,8 @@ void addReplyBulkLongLong(client *c, long long ll);
 void addReply(client *c, robj *obj);
 void addReplySds(client *c, sds s);
 void addReplyBulkSds(client *c, sds s);
-void addReplyErrorSafe(client *c, char *s, size_t len);
+void addReplyErrorObject(client *c, robj *err);
+void addReplyErrorSds(client *c, sds err);
 void addReplyError(client *c, const char *err);
 void addReplyStatus(client *c, const char *status);
 void addReplyDouble(client *c, double d);
@@ -1683,6 +1702,10 @@ int listenToPort(int port, int *fds, int *count);
 void pauseClients(mstime_t duration);
 int clientsArePaused(void);
 void processEventsWhileBlocked(void);
+void loadingCron(void);
+void whileBlockedCron();
+void blockingOperationStarts();
+void blockingOperationEnds();
 int handleClientsWithPendingWrites(void);
 int handleClientsWithPendingWritesUsingThreads(void);
 int handleClientsWithPendingReadsUsingThreads(void);
@@ -1884,7 +1907,7 @@ void sendChildCOWInfo(int ptype, char *pname);
 extern rax *Users;
 extern user *DefaultUser;
 void ACLInit(void);
-/* Return values for ACLCheckUserCredentials(). */
+/* Return values for ACLCheckCommandPerm(). */
 #define ACL_OK 0
 #define ACL_DENIED_CMD 1
 #define ACL_DENIED_KEY 2
@@ -1924,7 +1947,7 @@ void addACLLogEntry(client *c, int reason, int keypos, sds username);
 /* Flags only used by the ZADD command but not by zsetAdd() API: */
 #define ZADD_CH (1<<16)      /* Return num of elements added or updated. */
 
-/* Struct to hold a inclusive/exclusive range spec by score comparison. */
+/* Struct to hold an inclusive/exclusive range spec by score comparison. */
 typedef struct {
     double min, max;
     int minex, maxex; /* are min or max exclusive? */
@@ -2016,6 +2039,7 @@ const char *evictPolicyToString(void);
 struct redisMemOverhead *getMemoryOverheadData(void);
 void freeMemoryOverheadData(struct redisMemOverhead *mh);
 void checkChildrenDone(void);
+int setOOMScoreAdj(int process_class);
 
 #define RESTART_SERVER_NONE 0
 #define RESTART_SERVER_GRACEFULLY (1<<0)     /* Do proper shutdown. */
@@ -2079,7 +2103,7 @@ void appendServerSaveParams(time_t seconds, int changes);
 void resetServerSaveParams(void);
 struct rewriteConfigState; /* Forward declaration to export API. */
 void rewriteConfigRewriteLine(struct rewriteConfigState *state, const char *option, sds line, int force);
-int rewriteConfig(char *path);
+int rewriteConfig(char *path, int force_all);
 void initConfigValues();
 
 /* db.c -- Keyspace access API */
@@ -2189,7 +2213,7 @@ void replyToBlockedClientTimedOut(client *c);
 int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int unit);
 void disconnectAllBlockedClients(void);
 void handleClientsBlockedOnKeys(void);
-void signalKeyAsReady(redisDb *db, robj *key);
+void signalKeyAsReady(redisDb *db, robj *key, int type);
 void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, robj *target, streamID *ids);
 
 /* timeout.c -- Blocked clients timeout and connections timeout. */
@@ -2278,6 +2302,7 @@ void saddCommand(client *c);
 void sremCommand(client *c);
 void smoveCommand(client *c);
 void sismemberCommand(client *c);
+void smismemberCommand(client *c);
 void scardCommand(client *c);
 void spopCommand(client *c);
 void srandmemberCommand(client *c);
@@ -2449,6 +2474,7 @@ int memtest_preserving_test(unsigned long *m, size_t bytes, int passes);
 void mixDigest(unsigned char *digest, void *ptr, size_t len);
 void xorDigest(unsigned char *digest, void *ptr, size_t len);
 int populateCommandTableParseFlags(struct redisCommand *c, char *strflags);
+void debugDelay(int usec);
 
 /* TLS stuff */
 void tlsInit(void);

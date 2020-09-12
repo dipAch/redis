@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "monotonic.h"
 #include "cluster.h"
 #include "slowlog.h"
 #include "bio.h"
@@ -70,7 +71,6 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 
 /* Global vars */
 struct redisServer server; /* Server global state */
-volatile unsigned long lru_clock; /* Server global current LRU time. */
 
 /* Our command table.
  *
@@ -115,7 +115,7 @@ volatile unsigned long lru_clock; /* Server global current LRU time. */
  * write:       Write command (may modify the key space).
  *
  * read-only:   All the non special commands just reading from keys without
- *              changing the content, or returning other informations like
+ *              changing the content, or returning other information like
  *              the TIME command. Special commands such administrative commands
  *              or transaction related commands (multi, exec, discard, ...)
  *              are not flagged as read-only commands, since they affect the
@@ -355,6 +355,10 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,1,2,1,0,0,0},
 
     {"sismember",sismemberCommand,3,
+     "read-only fast @set",
+     0,NULL,1,1,1,0,0,0},
+
+    {"smismember",smismemberCommand,-3,
      "read-only fast @set",
      0,NULL,1,1,1,0,0,0},
 
@@ -1288,7 +1292,7 @@ dictType objectKeyHeapPointerValueDictType = {
     dictVanillaFree            /* val destructor */
 };
 
-/* Set dictionary type. Keys are SDS strings, values are ot used. */
+/* Set dictionary type. Keys are SDS strings, values are not used. */
 dictType setDictType = {
     dictSdsHash,               /* hash function */
     NULL,                      /* key dup */
@@ -1393,9 +1397,8 @@ dictType clusterNodesBlackListDictType = {
     NULL                        /* val destructor */
 };
 
-/* Cluster re-addition blacklist. This maps node IDs to the time
- * we can re-add this node. The goal is to avoid readding a removed
- * node for some time. */
+/* Modules system dictionary type. Keys are module name,
+ * values are pointer to RedisModule struct. */
 dictType modulesDictType = {
     dictSdsCaseHash,            /* hash function */
     NULL,                       /* key dup */
@@ -1448,7 +1451,7 @@ void tryResizeHashTables(int dbid) {
 /* Our hash table implementation performs rehashing incrementally while
  * we write/read from the hash table. Still if the server is idle, the hash
  * table will use two tables for a long time. So we try to use 1 millisecond
- * of CPU time at every call of this function to perform some rehahsing.
+ * of CPU time at every call of this function to perform some rehashing.
  *
  * The function returns 1 if some rehashing was performed, otherwise 0
  * is returned. */
@@ -1470,8 +1473,8 @@ int incrementallyRehash(int dbid) {
  * as we want to avoid resizing the hash tables when there is a child in order
  * to play well with copy-on-write (otherwise when a resize happens lots of
  * memory pages are copied). The goal of this function is to update the ability
- * for dict.c to resize the hash tables accordingly to the fact we have o not
- * running childs. */
+ * for dict.c to resize the hash tables accordingly to the fact we have an
+ * active fork child running. */
 void updateDictResizePolicy(void) {
     if (!hasActiveChildProcess())
         dictEnableResize();
@@ -1479,7 +1482,7 @@ void updateDictResizePolicy(void) {
         dictDisableResize();
 }
 
-/* Return true if there are no active children processes doing RDB saving,
+/* Return true if there are active children processes doing RDB saving,
  * AOF rewriting, or some side process spawned by a loaded module. */
 int hasActiveChildProcess() {
     return server.rdb_child_pid != -1 ||
@@ -1497,7 +1500,8 @@ int allPersistenceDisabled(void) {
 
 /* Add a sample to the operations per second array of samples. */
 void trackInstantaneousMetric(int metric, long long current_reading) {
-    long long t = mstime() - server.inst_metric[metric].last_sample_time;
+    long long now = mstime();
+    long long t = now - server.inst_metric[metric].last_sample_time;
     long long ops = current_reading -
                     server.inst_metric[metric].last_sample_count;
     long long ops_sec;
@@ -1508,7 +1512,7 @@ void trackInstantaneousMetric(int metric, long long current_reading) {
         ops_sec;
     server.inst_metric[metric].idx++;
     server.inst_metric[metric].idx %= STATS_METRIC_SAMPLES;
-    server.inst_metric[metric].last_sample_time = mstime();
+    server.inst_metric[metric].last_sample_time = now;
     server.inst_metric[metric].last_sample_count = current_reading;
 }
 
@@ -1621,7 +1625,7 @@ int clientsCronTrackClientsMemUsage(client *c) {
     mem += sdsAllocSize(c->querybuf);
     mem += sizeof(client);
     /* Now that we have the memory used by the client, remove the old
-     * value from the old categoty, and add it back. */
+     * value from the old category, and add it back. */
     server.stat_clients_type_memory[c->client_cron_last_memory_type] -=
         c->client_cron_last_memory_usage;
     server.stat_clients_type_memory[type] += mem;
@@ -1783,14 +1787,6 @@ void checkChildrenDone(void) {
     int statloc;
     pid_t pid;
 
-    /* If we have a diskless rdb child (note that we support only one concurrent
-     * child), we want to avoid collecting it's exit status and acting on it
-     * as long as we didn't finish to drain the pipe, since then we're at risk
-     * of starting a new fork and a new pipe before we're done with the previous
-     * one. */
-    if (server.rdb_child_pid != -1 && server.rdb_pipe_conns)
-        return;
-
     if ((pid = wait3(&statloc,WNOHANG,NULL)) != 0) {
         int exitcode = WEXITSTATUS(statloc);
         int bysignal = 0;
@@ -1835,6 +1831,41 @@ void checkChildrenDone(void) {
 
         /* start any pending forks immediately. */
         replicationStartPendingFork();
+    }
+}
+
+/* Called from serverCron and loadingCron to update cached memory metrics. */
+void cronUpdateMemoryStats() {
+    /* Record the max memory used since the server was started. */
+    if (zmalloc_used_memory() > server.stat_peak_memory)
+        server.stat_peak_memory = zmalloc_used_memory();
+
+    run_with_period(100) {
+        /* Sample the RSS and other metrics here since this is a relatively slow call.
+         * We must sample the zmalloc_used at the same time we take the rss, otherwise
+         * the frag ratio calculate may be off (ratio of two samples at different times) */
+        server.cron_malloc_stats.process_rss = zmalloc_get_rss();
+        server.cron_malloc_stats.zmalloc_used = zmalloc_used_memory();
+        /* Sampling the allocator info can be slow too.
+         * The fragmentation ratio it'll show is potentially more accurate
+         * it excludes other RSS pages such as: shared libraries, LUA and other non-zmalloc
+         * allocations, and allocator reserved pages that can be pursed (all not actual frag) */
+        zmalloc_get_allocator_info(&server.cron_malloc_stats.allocator_allocated,
+                                   &server.cron_malloc_stats.allocator_active,
+                                   &server.cron_malloc_stats.allocator_resident);
+        /* in case the allocator isn't providing these stats, fake them so that
+         * fragmentation info still shows some (inaccurate metrics) */
+        if (!server.cron_malloc_stats.allocator_resident) {
+            /* LUA memory isn't part of zmalloc_used, but it is part of the process RSS,
+             * so we must deduct it in order to be able to calculate correct
+             * "allocator fragmentation" ratio */
+            size_t lua_memory = lua_gc(server.lua,LUA_GCCOUNT,0)*1024LL;
+            server.cron_malloc_stats.allocator_resident = server.cron_malloc_stats.process_rss - lua_memory;
+        }
+        if (!server.cron_malloc_stats.allocator_active)
+            server.cron_malloc_stats.allocator_active = server.cron_malloc_stats.allocator_resident;
+        if (!server.cron_malloc_stats.allocator_allocated)
+            server.cron_malloc_stats.allocator_allocated = server.cron_malloc_stats.zmalloc_used;
     }
 }
 
@@ -1906,37 +1937,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * LRU_CLOCK_RESOLUTION define. */
     server.lruclock = getLRUClock();
 
-    /* Record the max memory used since the server was started. */
-    if (zmalloc_used_memory() > server.stat_peak_memory)
-        server.stat_peak_memory = zmalloc_used_memory();
-
-    run_with_period(100) {
-        /* Sample the RSS and other metrics here since this is a relatively slow call.
-         * We must sample the zmalloc_used at the same time we take the rss, otherwise
-         * the frag ratio calculate may be off (ratio of two samples at different times) */
-        server.cron_malloc_stats.process_rss = zmalloc_get_rss();
-        server.cron_malloc_stats.zmalloc_used = zmalloc_used_memory();
-        /* Sampling the allcator info can be slow too.
-         * The fragmentation ratio it'll show is potentically more accurate
-         * it excludes other RSS pages such as: shared libraries, LUA and other non-zmalloc
-         * allocations, and allocator reserved pages that can be pursed (all not actual frag) */
-        zmalloc_get_allocator_info(&server.cron_malloc_stats.allocator_allocated,
-                                   &server.cron_malloc_stats.allocator_active,
-                                   &server.cron_malloc_stats.allocator_resident);
-        /* in case the allocator isn't providing these stats, fake them so that
-         * fragmention info still shows some (inaccurate metrics) */
-        if (!server.cron_malloc_stats.allocator_resident) {
-            /* LUA memory isn't part of zmalloc_used, but it is part of the process RSS,
-             * so we must desuct it in order to be able to calculate correct
-             * "allocator fragmentation" ratio */
-            size_t lua_memory = lua_gc(server.lua,LUA_GCCOUNT,0)*1024LL;
-            server.cron_malloc_stats.allocator_resident = server.cron_malloc_stats.process_rss - lua_memory;
-        }
-        if (!server.cron_malloc_stats.allocator_active)
-            server.cron_malloc_stats.allocator_active = server.cron_malloc_stats.allocator_resident;
-        if (!server.cron_malloc_stats.allocator_allocated)
-            server.cron_malloc_stats.allocator_allocated = server.cron_malloc_stats.zmalloc_used;
-    }
+    cronUpdateMemoryStats();
 
     /* We received a SIGTERM, shutting down here in a safe way, as it is
      * not ok doing so inside the signal handler. */
@@ -2039,7 +2040,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     /* AOF write errors: in this case we have a buffer to flush as well and
      * clear the AOF error in case of success to make the DB writable again,
      * however to try every second is enough in case of 'hz' is set to
-     * an higher frequency. */
+     * a higher frequency. */
     run_with_period(1000) {
         if (server.aof_last_write_status == C_ERR)
             flushAppendOnlyFile(0);
@@ -2100,6 +2101,64 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
     server.cronloops++;
     return 1000/server.hz;
+}
+
+
+void blockingOperationStarts() {
+    updateCachedTime(0);
+    server.blocked_last_cron = server.mstime;
+}
+
+void blockingOperationEnds() {
+    server.blocked_last_cron = 0;
+}
+
+/* This function fill in the role of serverCron during RDB or AOF loading, and
+ * also during blocked scripts.
+ * It attempts to do its duties at a similar rate as the configured server.hz,
+ * and updates cronloops variable so that similarly to serverCron, the
+ * run_with_period can be used. */
+void whileBlockedCron() {
+    /* Here we may want to perform some cron jobs (normally done server.hz times
+     * per second). */
+
+    /* Since this function depends on a call to blockingOperationStarts, let's
+     * make sure it was done. */
+    serverAssert(server.blocked_last_cron);
+
+    /* In case we where called too soon, leave right away. This way one time
+     * jobs after the loop below don't need an if. and we don't bother to start
+     * latency monitor if this function is called too often. */
+    if (server.blocked_last_cron >= server.mstime)
+        return;
+
+    mstime_t latency;
+    latencyStartMonitor(latency);
+
+    /* In some cases we may be called with big intervals, so we may need to do
+     * extra work here. This is because some of the functions in serverCron rely
+     * on the fact that it is performed every 10 ms or so. For instance, if
+     * activeDefragCycle needs to utilize 25% cpu, it will utilize 2.5ms, so we
+     * need to call it multiple times. */
+    long hz_ms = 1000/server.hz;
+    while (server.blocked_last_cron < server.mstime) {
+
+        /* Defrag keys gradually. */
+        activeDefragCycle();
+
+        server.blocked_last_cron += hz_ms;
+        /* Increment cronloop so that run_with_period works. */
+        server.cronloops++;
+    }
+
+    /* Other cron jobs do not need to be done in a loop. No need to check
+     * server.blocked_last_cron since we have an early exit at the top. */
+
+    /* Update memory stats during loading (excluding blocked scripts) */
+    if (server.loading) cronUpdateMemoryStats();
+
+    latencyEndMonitor(latency);
+    latencyAddSampleIfNeeded("while-blocked-cron",latency);
 }
 
 extern int ProcessingEventsWhileBlocked;
@@ -2209,7 +2268,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (moduleCount()) moduleReleaseGIL();
 }
 
-/* This function is called immadiately after the event loop multiplexing
+/* This function is called immediately after the event loop multiplexing
  * API returned, and the control is going to soon return to Redis by invoking
  * the different events callbacks. */
 void afterSleep(struct aeEventLoop *eventLoop) {
@@ -2421,13 +2480,17 @@ void initServerConfig(void) {
     for (j = 0; j < CLIENT_TYPE_OBUF_COUNT; j++)
         server.client_obuf_limits[j] = clientBufferLimitsDefaults[j];
 
+    /* Linux OOM Score config */
+    for (j = 0; j < CONFIG_OOM_COUNT; j++)
+        server.oom_score_adj_values[j] = configOOMScoreAdjValuesDefaults[j];
+
     /* Double constants initialization */
     R_Zero = 0.0;
     R_PosInf = 1.0/R_Zero;
     R_NegInf = -1.0/R_Zero;
     R_Nan = R_Zero/R_Zero;
 
-    /* Command table -- we initiialize it here as it is part of the
+    /* Command table -- we initialize it here as it is part of the
      * initial configuration, since command names may be changed via
      * redis.conf using the rename-command directive. */
     server.commands = dictCreate(&commandTableDictType,NULL);
@@ -2491,7 +2554,7 @@ int restartServer(int flags, mstime_t delay) {
     /* Config rewriting. */
     if (flags & RESTART_SERVER_CONFIG_REWRITE &&
         server.configfile &&
-        rewriteConfig(server.configfile) == -1)
+        rewriteConfig(server.configfile, 0) == -1)
     {
         serverLog(LL_WARNING,"Can't restart: configuration rewrite process "
                              "failed");
@@ -2524,6 +2587,59 @@ int restartServer(int flags, mstime_t delay) {
     _exit(1);
 
     return C_ERR; /* Never reached. */
+}
+
+static void readOOMScoreAdj(void) {
+#ifdef HAVE_PROC_OOM_SCORE_ADJ
+    char buf[64];
+    int fd = open("/proc/self/oom_score_adj", O_RDONLY);
+
+    if (fd < 0) return;
+    if (read(fd, buf, sizeof(buf)) > 0)
+        server.oom_score_adj_base = atoi(buf);
+    close(fd);
+#endif
+}
+
+/* This function will configure the current process's oom_score_adj according
+ * to user specified configuration. This is currently implemented on Linux
+ * only.
+ *
+ * A process_class value of -1 implies OOM_CONFIG_MASTER or OOM_CONFIG_REPLICA,
+ * depending on current role.
+ */
+int setOOMScoreAdj(int process_class) {
+
+    if (!server.oom_score_adj) return C_OK;
+    if (process_class == -1)
+        process_class = (server.masterhost ? CONFIG_OOM_REPLICA : CONFIG_OOM_MASTER);
+
+    serverAssert(process_class >= 0 && process_class < CONFIG_OOM_COUNT);
+
+#ifdef HAVE_PROC_OOM_SCORE_ADJ
+    int fd;
+    int val;
+    char buf[64];
+
+    val = server.oom_score_adj_base + server.oom_score_adj_values[process_class];
+    if (val > 1000) val = 1000;
+    if (val < -1000) val = -1000;
+
+    snprintf(buf, sizeof(buf) - 1, "%d\n", val);
+
+    fd = open("/proc/self/oom_score_adj", O_WRONLY);
+    if (fd < 0 || write(fd, buf, strlen(buf)) < 0) {
+        serverLog(LOG_WARNING, "Unable to write oom_score_adj: %s", strerror(errno));
+        if (fd != -1) close(fd);
+        return C_ERR;
+    }
+
+    close(fd);
+    return C_OK;
+#else
+    /* Unsupported */
+    return C_ERR;
+#endif
 }
 
 /* This function will try to raise the max number of open files accordingly to
@@ -2748,6 +2864,7 @@ void resetServerStats(void) {
     server.stat_net_output_bytes = 0;
     server.stat_unexpected_error_replies = 0;
     server.aof_delayed_fsync = 0;
+    server.blocked_last_cron = 0;
 }
 
 void initServer(void) {
@@ -2793,6 +2910,8 @@ void initServer(void) {
 
     createSharedObjects();
     adjustOpenFilesLimit();
+    const char *clk_msg = monotonicInit();
+    serverLog(LL_NOTICE, "monotonic clock: %s", clk_msg);
     server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
     if (server.el == NULL) {
         serverLog(LL_WARNING,
@@ -3035,7 +3154,7 @@ int populateCommandTableParseFlags(struct redisCommand *c, char *strflags) {
 }
 
 /* Populates the Redis Command Table starting from the hard coded list
- * we have on top of redis.c file. */
+ * we have on top of server.c file. */
 void populateCommandTable(void) {
     int j;
     int numcommands = sizeof(redisCommandTable)/sizeof(struct redisCommand);
@@ -3169,12 +3288,12 @@ void propagate(struct redisCommand *cmd, int dbid, robj **argv, int argc,
  *
  * 'cmd' must be a pointer to the Redis command to replicate, dbid is the
  * database ID the command should be propagated into.
- * Arguments of the command to propagte are passed as an array of redis
+ * Arguments of the command to propagate are passed as an array of redis
  * objects pointers of len 'argc', using the 'argv' vector.
  *
  * The function does not take a reference to the passed 'argv' vector,
  * so it is up to the caller to release the passed argv (but it is usually
- * stack allocated).  The function autoamtically increments ref count of
+ * stack allocated).  The function automatically increments ref count of
  * passed objects, so the caller does not need to. */
 void alsoPropagate(struct redisCommand *cmd, int dbid, robj **argv, int argc,
                    int target)
@@ -3334,7 +3453,7 @@ void call(client *c, int flags) {
         if (c->flags & CLIENT_FORCE_AOF) propagate_flags |= PROPAGATE_AOF;
 
         /* However prevent AOF / replication propagation if the command
-         * implementations called preventCommandPropagation() or similar,
+         * implementation called preventCommandPropagation() or similar,
          * or if we don't have the call() flags to do so. */
         if (c->flags & CLIENT_PREVENT_REPL_PROP ||
             !(flags & CMD_CALL_PROPAGATE_REPL))
@@ -3417,14 +3536,15 @@ void call(client *c, int flags) {
 /* Used when a command that is ready for execution needs to be rejected, due to
  * varios pre-execution checks. it returns the appropriate error to the client.
  * If there's a transaction is flags it as dirty, and if the command is EXEC,
- * it aborts the transaction. */
+ * it aborts the transaction.
+ * Note: 'reply' is expected to end with \r\n */
 void rejectCommand(client *c, robj *reply) {
     flagTransaction(c);
     if (c->cmd && c->cmd->proc == execCommand) {
         execCommandAbort(c, reply->ptr);
     } else {
         /* using addReplyError* rather than addReply so that the error can be logged. */
-        addReplyErrorSafe(c, reply->ptr, sdslen(reply->ptr));
+        addReplyErrorObject(c, reply);
     }
 }
 
@@ -3434,10 +3554,13 @@ void rejectCommandFormat(client *c, const char *fmt, ...) {
     va_start(ap,fmt);
     sds s = sdscatvprintf(sdsempty(),fmt,ap);
     va_end(ap);
+    /* Make sure there are no newlines in the string, otherwise invalid protocol
+     * is emitted (The args come from the user, they may contain any character). */
+    sdsmapchars(s, "\r\n", "  ",  2);
     if (c->cmd && c->cmd->proc == execCommand) {
         execCommandAbort(c, s);
     } else {
-        addReplyErrorSafe(c, s, sdslen(s));
+        addReplyErrorSds(c, s);
     }
     sdsfree(s);
 }
@@ -3567,20 +3690,25 @@ int processCommand(client *c) {
          * into a slave, that may be the active client, to be freed. */
         if (server.current_client == NULL) return C_ERR;
 
-        /* It was impossible to free enough memory, and the command the client
-         * is trying to execute is denied during OOM conditions or the client
-         * is in MULTI/EXEC context? Error. */
-        if (out_of_memory &&
-            (is_denyoom_command ||
-             (c->flags & CLIENT_MULTI &&
-              c->cmd->proc != discardCommand)))
-        {
+        int reject_cmd_on_oom = is_denyoom_command;
+        /* If client is in MULTI/EXEC context, queuing may consume an unlimited
+         * amount of memory, so we want to stop that.
+         * However, we never want to reject DISCARD, or even EXEC (unless it
+         * contains denied commands, in which case is_denyoom_command is already
+         * set. */
+        if (c->flags & CLIENT_MULTI &&
+            c->cmd->proc != execCommand &&
+            c->cmd->proc != discardCommand) {
+            reject_cmd_on_oom = 1;
+        }
+
+        if (out_of_memory && reject_cmd_on_oom) {
             rejectCommand(c, shared.oomerr);
             return C_OK;
         }
 
         /* Save out_of_memory result at script start, otherwise if we check OOM
-         * untill first write within script, memory used by lua stack and
+         * until first write within script, memory used by lua stack and
          * arguments might interfere. */
         if (c->cmd->proc == evalCommand || c->cmd->proc == evalShaCommand) {
             server.lua_oom = out_of_memory;
@@ -3602,7 +3730,7 @@ int processCommand(client *c) {
             rejectCommand(c, shared.bgsaveerr);
         else
             rejectCommandFormat(c,
-                "-MISCONF Errors writing to the AOF file: %s\r\n",
+                "-MISCONF Errors writing to the AOF file: %s",
                 strerror(server.aof_last_write_errno));
         return C_OK;
     }
@@ -3818,7 +3946,7 @@ int prepareForShutdown(int flags) {
 
 /*================================== Commands =============================== */
 
-/* Sometimes Redis cannot accept write commands because there is a perstence
+/* Sometimes Redis cannot accept write commands because there is a persistence
  * error with the RDB or AOF file, and Redis is configured in order to stop
  * accepting writes in such situation. This function returns if such a
  * condition is active, and the type of the condition.
@@ -4083,7 +4211,7 @@ sds genRedisInfoString(const char *section) {
             "lru_clock:%u\r\n"
             "executable:%s\r\n"
             "config_file:%s\r\n"
-            "io_threads_active:%d\r\n",
+            "io_threads_active:%i\r\n",
             REDIS_VERSION,
             redisGitSHA1(),
             strtol(redisGitDirty(),NULL,10) > 0,
@@ -4674,7 +4802,7 @@ void linuxMemoryWarnings(void) {
         serverLog(LL_WARNING,"WARNING overcommit_memory is set to 0! Background save may fail under low memory condition. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.");
     }
     if (THPIsEnabled()) {
-        serverLog(LL_WARNING,"WARNING you have Transparent Huge Pages (THP) support enabled in your kernel. This will create latency and memory usage issues with Redis. To fix this issue run the command 'echo never > /sys/kernel/mm/transparent_hugepage/enabled' as root, and add it to your /etc/rc.local in order to retain the setting after a reboot. Redis must be restarted after THP is disabled.");
+        serverLog(LL_WARNING,"WARNING you have Transparent Huge Pages (THP) support enabled in your kernel. This will create latency and memory usage issues with Redis. To fix this issue run the command 'echo madvise > /sys/kernel/mm/transparent_hugepage/enabled' as root, and add it to your /etc/rc.local in order to retain the setting after a reboot. Redis must be restarted after THP is disabled (set to 'madvise' or 'never').");
     }
 }
 #endif /* __linux__ */
@@ -4860,13 +4988,24 @@ void setupChildSignalHandlers(void) {
     return;
 }
 
+/* After fork, the child process will inherit the resources
+ * of the parent process, e.g. fd(socket or flock) etc.
+ * should close the resources not used by the child process, so that if the
+ * parent restarts it can bind/lock despite the child possibly still running. */
+void closeClildUnusedResourceAfterFork() {
+    closeListeningSockets(0);
+    if (server.cluster_enabled && server.cluster_config_file_lock_fd != -1)
+        close(server.cluster_config_file_lock_fd);  /* don't care if this fails */
+}
+
 int redisFork() {
     int childpid;
     long long start = ustime();
     if ((childpid = fork()) == 0) {
         /* Child */
-        closeListeningSockets(0);
+        setOOMScoreAdj(CONFIG_OOM_BGCHILD);
         setupChildSignalHandlers();
+        closeClildUnusedResourceAfterFork();
     } else {
         /* Parent */
         server.stat_fork_time = ustime()-start;
@@ -4948,7 +5087,8 @@ void loadDataFromDisk(void) {
 void redisOutOfMemoryHandler(size_t allocation_size) {
     serverLog(LL_WARNING,"Out Of Memory allocating %zu bytes!",
         allocation_size);
-    serverPanic("Redis aborting for OUT OF MEMORY");
+    serverPanic("Redis aborting for OUT OF MEMORY. Allocating %zu bytes!", 
+        allocation_size);
 }
 
 void redisSetProcTitle(char *title) {
@@ -5077,6 +5217,7 @@ int main(int argc, char **argv) {
     tzset(); /* Populates 'timezone' global. */
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
     srand(time(NULL)^getpid());
+    srandom(time(NULL)^getpid());
     gettimeofday(&tv,NULL);
     crc64_init();
 
@@ -5178,6 +5319,10 @@ int main(int argc, char **argv) {
         sdsfree(options);
     }
 
+    server.supervised = redisIsSupervised(server.supervised_mode);
+    int background = server.daemonize && !server.supervised;
+    if (background) daemonize();
+
     serverLog(LL_WARNING, "oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo");
     serverLog(LL_WARNING,
         "Redis version=%s, bits=%d, commit=%s, modified=%d, pid=%d, just started",
@@ -5193,10 +5338,7 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING, "Configuration loaded");
     }
 
-    server.supervised = redisIsSupervised(server.supervised_mode);
-    int background = server.daemonize && !server.supervised;
-    if (background) daemonize();
-
+    readOOMScoreAdj();
     initServer();
     if (background || server.pidfile) createPidFile();
     redisSetProcTitle(argv[0]);
@@ -5209,6 +5351,7 @@ int main(int argc, char **argv) {
     #ifdef __linux__
         linuxMemoryWarnings();
     #endif
+        moduleInitModulesSystemLast();
         moduleLoadFromQueue();
         ACLLoadUsersAtStartup();
         InitServerLast();
@@ -5248,6 +5391,8 @@ int main(int argc, char **argv) {
     }
 
     redisSetCpuAffinity(server.server_cpulist);
+    setOOMScoreAdj(-1);
+
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;
