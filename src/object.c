@@ -616,24 +616,31 @@ void stringObjectPalindrome(client *c, robj *o) {
     serverAssertWithInfo(NULL, o, o->type == OBJ_STRING);
 
     sds value;
-    size_t string_length, tail_pointer;
+    size_t string_length, tail_pointer, idx;
 
     if (sdsEncodedObject(o)) {
         value = o->ptr;
         string_length = sdslen(value);
     } else {
-        char buf[32];
-        string_length = ll2string(buf, sizeof(buf), (long)o->ptr);
+        char buf[64];
+        string_length = ll2string(buf, sizeof(buf), (long long)o->ptr);
         value = (sds)buf;
     }
 
-    tail_pointer = string_length - 1;
+    if (string_length <= 0) {
+        addReplyBulkCString(c, "false");
+        return;
+    }
 
-    for (size_t idx=0; idx < string_length; idx++) {
+    tail_pointer = string_length - 1;
+    idx = 0;
+
+    while (idx < tail_pointer) {
         if (value[idx] != value[tail_pointer]) {
             addReplyBulkCString(c, "false");
             return;
         }
+        idx++;
         tail_pointer--;
     }
 

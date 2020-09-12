@@ -161,6 +161,29 @@ start_server {tags {"string"}} {
         assert_equal 20 [r strlen mystring]
     }
 
+    test "PALINDROME against integer-encoded value" {
+        r set myinteger -9900
+        assert_equal "false" [r palindrome myinteger]
+        r set myinteger 1001
+        assert_equal "true" [r palindrome myinteger]
+        r set myinteger 999
+        assert_equal "true" [r palindrome myinteger]
+    }
+
+    test "PALINDROME against even length plain string" {
+        r set mystring "foozzz"
+        assert_equal "false" [r palindrome mystring]
+        r set mystring "foooof"
+        assert_equal "true" [r palindrome mystring]
+    }
+
+    test "PALINDROME against odd length plain string" {
+        r set mystring "adcbz"
+        assert_equal "false" [r palindrome mystring]
+        r set mystring "abcba"
+        assert_equal "true" [r palindrome mystring]
+    }
+
     test "SETBIT against non-existing key" {
         r del mykey
         assert_equal 0 [r setbit mykey 1 1]
